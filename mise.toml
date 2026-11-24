@@ -1,0 +1,23 @@
+[tools]
+elixir = "1.19.5-otp-27"
+erlang = "27.3.4.16"
+node = "26.10.0"
+"npm:@fission-ai/openspec" = "1.14.0"
+
+[tasks.setup]
+description = "Fetch dependencies"
+run = "mix deps.get"
+
+[tasks."spec:validate"]
+description = "Validate all OpenSpec artifacts strictly"
+run = "openspec validate --all --strict --no-interactive"
+
+[tasks.check]
+description = "Format, compile, strict Credo, pure library tests and OpenSpec validation; no real backend"
+run = [
+  "mix format --check-formatted",
+  "mix compile --warnings-as-errors",
+  "mix credo --strict",
+  "MIX_ENV=test mix do compile --warnings-as-errors + test --warnings-as-errors",
+  "openspec validate --all --strict --no-interactive",
+]

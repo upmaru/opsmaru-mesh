@@ -1,0 +1,16 @@
+# Build and dependency outputs
+/_build/
+/deps/
+/doc/
+/cover/
+/.fetch
+erl_crash.dump
+*.ez
+opsmaru_mesh-*.tar
+/tmp/
+
+# Local credentials and acceptance state
+.env
+.env.*
+!.env.example
+.integration/

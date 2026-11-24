@@ -1,0 +1,22 @@
+schema: spec-driven
+context: |
+  opsmaru-mesh is a pure Elixir library, OTP application :opsmaru_mesh, rooted
+  at Opsmaru.Mesh. It has no application callback and never starts
+  processes, listeners, state or backend connections on load. It is the
+  control plane for cross-node networking between Incus hosts registered in
+  central Opsmaru (upmaru/opsmaru), which is its only planned consumer and
+  owns persistence, registration, tenant identity, scheduling and UI. The
+  data plane is WireGuard between per-node router instances; traffic never
+  flows through Opsmaru or this library, and an applied mesh keeps working
+  while the control plane is down.
+  All Incus access goes through the opsmaru_incus Hex package
+  (upmaru/opsmaru-incus): no host agent, SSH, host CLI or socket probing.
+  The reference backend is Incus v7.0.1; constraints quoted from it in
+  designs must cite the source or docs they were checked against.
+  Isolation between Incus projects is the first security property: default
+  deny, never widened by a failed or partial apply. Do not describe the mesh
+  as zero trust until identity-bound policy is implemented and verified.
+  Pure unit, recorded-fixture and explicit real-Incus acceptance evidence are
+  distinct. Pin dependencies as ranges here; consumers lock exact versions.
+  Use Git Flow feature branches from develop. The canonical check is
+  mise run check.
