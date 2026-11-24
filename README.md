@@ -9,7 +9,9 @@ isolation through the Incus API (via
 directly between per-node router instances and never through the control
 plane.
 
-**Status:** design in progress. Nothing is implemented yet.
+**Status:** design only. See
+[`openspec/changes/add-mesh-foundation`](openspec/changes/add-mesh-foundation/proposal.md).
+Nothing is implemented yet.
 
 ## Development
 
