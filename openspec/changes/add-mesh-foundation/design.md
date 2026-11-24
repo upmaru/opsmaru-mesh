@@ -19,6 +19,10 @@ Constraints checked against Incus v7.0.1 (source at `github.com/lxc/incus/v7@v7.
 | `restricted.*` keys only take effect when `restricted=true`, which also turns on blocking defaults for every other `restricted.*` key (backups, snapshots, privileged containers, disk devices, …). | `doc/config_options.txt` project-restricted group |
 | A bridged NIC's `ipv4.routes` adds host routes to that NIC. No project restriction covers it. | `internal/server/device/nic_bridged.go:836-842`; no reference in `internal/server/project/permissions.go` |
 | ACL objects accept only `user.*` config keys. | `doc/howto/network_acls.md` |
+| nftables is the only firewall driver; there is no xtables fallback to detect. | `internal/server/firewall/drivers/` holds only `drivers_nftables*.go` |
+| A container's `linux.kernel_modules` makes Incus load those modules on the host before starting it. | `doc/config_options.txt:2167` |
+| Launching from an OCI registry needs a `skopeo` binary on the host: "OCI container handling requires \"skopeo\" be present on the system". | `client/oci_images.go:87-89` |
+| `wg show <if> dump` prints the interface private key on its first line; `latest-handshakes`, `transfer` and `endpoints` do not. | wireguard-tools `wg(8)` |
 
 ## Goals / Non-Goals
 
@@ -45,6 +49,7 @@ Constraints checked against Incus v7.0.1 (source at `github.com/lxc/incus/v7@v7.
 - **Allocation**, pure: `allocate_project/2` and `allocate_node_subnet/3` take the mesh configuration and the existing allocations and return a new allocation or a typed error.
 - **Desired state**, pure: `desired/2` takes one node record and the mesh view relevant to it (its joined projects, their allocations and the peer records) and returns the complete list of Incus objects that node should have.
 - **Apply / remove**: `apply/3` and `remove/3` take an `opsmaru_incus` client context supplied by the host, read the node's current objects, and converge them on the desired state. They return a per-step result, and any newly learned public keys, for the host to persist.
+- **Status**, read-only: `status/2` takes a client context and a node record and returns each router's per-peer handshake state (decision 12). It changes nothing.
 
 The library never stores, schedules or retries anything. When a project joins or a node's peers change, central Opsmaru calls `apply/3` for each affected node.
 
@@ -91,19 +96,22 @@ The router for project `P` on node `N` is a container `om<idx>` in an Opsmaru-ow
 
 - **`eth0` on the project bridge:** static `ipv4.address` = last host of the node subnet, and `ipv4.routes` = the project block. The host therefore routes the project's remote subnets to the router. The node's own subnet is directly connected and wins by longest-prefix match.
 - **`eth1` on the node's transit bridge** (decision 6), used only for WireGuard UDP.
+- **A state volume** `om<idx>-state` mounted at `/var/lib/opsmaru-mesh`, holding its key and pushed config (decision 11).
 - **Inside:** a WireGuard interface `wg0` (MTU from decision 8), and nftables rules that forward only between `wg0` and `eth0`, only for traffic whose source and destination are both in the project block, and between peers on `wg0` when the router is a relay (decision 7). All other forwarding is dropped. `eth1` accepts only the project's WireGuard port.
+
+The router has `linux.kernel_modules=wireguard`, so Incus loads the module on the host before the router starts. An unprivileged container can't load modules itself, and the host needs no manual setup. `nf_tables` is already loaded because Incus's own firewall uses it.
 
 The router's `eth0` has no `security.ipv4_filtering`, because it legitimately forwards remote sources. Its integrity rests on living in an Opsmaru-owned project.
 
 One router per project, rather than one router per node with VRFs, means a single router never holds two projects' plaintext. Isolation then follows from how the routers are built, not from rules that must stay correct. The cost is one small container per project per node.
 
-**Image:** the host supplies an image source and alias in the mesh configuration. The image must provide `ip`, `wg` and `nft`. The library ships the boot script and documents the requirements but does not choose or download an image.
+**Image:** see decision 11.
 
-**Boot persistence:** the library pushes an idempotent init script plus config files (`/etc/opsmaru-mesh/peers.conf`, `/etc/opsmaru-mesh/rules.nft`). The router re-applies them at every boot, so a router or host restart needs no control plane.
+**Boot persistence:** the library pushes an idempotent init script plus config files (`/var/lib/opsmaru-mesh/peers.conf`, `/var/lib/opsmaru-mesh/rules.nft`, on the router state volume (decision 11)). The router re-applies them at every boot, so a router or host restart needs no control plane.
 
 ### 5. Keys are generated on the router
 
-`apply/3` runs one `exec` in the router. It creates `/etc/opsmaru-mesh/private.key` with `umask 077` if the file is missing, then prints only the derived public key. The library checks the output is exactly one 32-byte base64 key and returns it for the host to store. The private key is never read, pushed, logged or returned. Pushed peer files hold public keys, endpoints and allowed IPs only, and the private key is loaded with `wg set wg0 private-key`.
+`apply/3` runs one `exec` in the router. It creates `/var/lib/opsmaru-mesh/private.key` with `umask 077` if the file is missing, then prints only the derived public key. The library checks the output is exactly one 32-byte base64 key and returns it for the host to store. The private key is never read, pushed, logged or returned. Pushed peer files hold public keys, endpoints and allowed IPs only, and the private key is loaded with `wg set wg0 private-key`.
 
 Rotating a key means removing the file, re-running apply, and re-applying the router's peers.
 
@@ -138,7 +146,8 @@ The host supplies:
 - the mesh range (e.g. `10.128.0.0/9`);
 - the project block prefix (default /16);
 - the node subnet prefix (default /24);
-- the MTU (default 1420; hosts nested behind extra encapsulation, such as Macus, may need less).
+- the MTU (default 1420; hosts nested behind extra encapsulation, such as Macus, may need less);
+- the storage pool for router state volumes, and the router image source (decision 11).
 
 Block index 0 is reserved: its first node-sized subnet is the transit range. Allocation takes the lowest free index and is deterministic for a given set of existing allocations.
 
@@ -157,22 +166,63 @@ This needs real-cluster evidence. In this change, `apply/3` returns `{:error, :c
 
 Steps, each idempotent and each only after the previous one succeeded:
 
-1. preflight (not clustered, nftables firewall, kernel ≥ 5.6, no address overlap, every other non-`default` project restricted away from mesh bridges);
+1. preflight (not clustered, kernel ≥ 5.6, no address overlap, every other non-`default` project restricted away from mesh bridges);
 2. isolation ACL;
 3. project bridge with the ACL attached;
 4. transit bridge;
-5. `opsmaru-mesh` project and router instance;
-6. key exec;
-7. router config push and reload;
-8. network forward (reachable nodes);
-9. project restrictions;
-10. default-profile NIC.
+5. router image present in the `opsmaru-mesh` project with the pinned fingerprint (decision 11);
+6. `opsmaru-mesh` project, router state volume and router instance;
+7. key exec;
+8. router config push and reload;
+9. network forward (reachable nodes);
+10. project restrictions;
+11. default-profile NIC.
 
-From step 3 on, the bridge is always isolated. Until step 10, no tenant instance is attached to it by default. Stopping at any step therefore leaves access the same as or narrower than the final state. A failure stops the run and reports the step, and the next run resumes. Mutations are never retried inside one run. A write that may have been accepted is re-read on the next run, not replayed (matching `opsmaru_incus` semantics).
+From step 3 on, the bridge is always isolated. Until the last step, no tenant instance is attached to it by default. Stopping at any step therefore leaves access the same as or narrower than the final state. A failure stops the run and reports the step, and the next run resumes. Mutations are never retried inside one run. A write that may have been accepted is re-read on the next run, not replayed (matching `opsmaru_incus` semantics).
 
 The library touches only objects that carry `user.opsmaru.mesh.managed=true`, plus the keys it owns on a joined project and its default profile. For those, it returns the previous values so the host can store them, and `remove/3` restores them.
 
 Turning on `restricted=true` blocks other features by default (backups, snapshots, privileged containers and so on). By default, `apply/3` sets every other `restricted.*` key the project hasn't set to its permissive value, so joining the mesh changes only network access. A host may pass its own stricter values instead.
+
+### 11. The router image is built and published by this repository
+
+Nothing is installed on Incus hosts, so everything the router needs comes in its image. Three options were considered:
+
+- **A stock distribution image, plus packages installed by `exec` at creation.** Nothing to build. But every router's first boot then depends on a package mirror, versions drift between nodes, and offline hosts can't use it. Rejected.
+- **An OCI image from a registry.** The simplest build, but Incus 7.0.1 refuses OCI images without `skopeo` on the host, which breaks the no-host-install goal. Rejected as the default.
+- **An Incus image built here (chosen).** A minimal Alpine root filesystem containing busybox, OpenRC, `iproute2`, `wireguard-tools` (the `wg` binary only) and `nftables`, plus the mesh boot script. It has no daemon and no `wg-quick`, and the target size is under 16 MiB.
+
+The image is:
+
+- **Built by this repository's CI** as an Incus unified image tarball (`metadata.yaml` plus rootfs) for `x86_64` and `aarch64`. Its fingerprint is therefore the SHA-256 of the tarball.
+- **Published on the GitHub Release** for each `v*` tag, with that SHA-256 and a provenance attestation. It is never shipped in the Hex package.
+- **Pinned in the release:** each release of the library pins the fingerprint of the image built from the same commit, as the default for the mesh configuration. A host may override it with its own image, identified the same way.
+- **Delivered by the host,** in one of two ways chosen in the mesh configuration:
+  - `{:upload, stream_fun}`: the host provides the tarball bytes, and the library imports it through the Incus images API. Works on offline hosts.
+  - `{:server, url, protocol}`: Incus downloads it from an Incus or SimpleStreams server.
+
+  Either way, step 5 of the apply checks that the image in the `opsmaru-mesh` project has exactly the pinned fingerprint before any router is created from it, and fails otherwise. Routers are created by fingerprint, never by an alias that could move.
+
+Upgrading the image means a new release with a new pinned fingerprint. `apply/3` then rebuilds each router from the new image (Incus instance rebuild), one at a time. The key and pushed config don't live in the image's root filesystem. They live on a custom storage volume per router, `om<idx>-state` in the `opsmaru-mesh` project on a host-chosen storage pool, mounted at `/var/lib/opsmaru-mesh`. A rebuild therefore keeps the same key and peers don't change. The private key is never read through the API, even during an upgrade.
+
+### 12. Peer health is reported, not assumed
+
+Some prerequisites can't be seen through the Incus API: UDP ports opened in the host firewall or cloud security group, and host firewalls that drop forwarded traffic (Docker's `FORWARD` drop policy is the classic case). When they're wrong, tunnels simply never connect.
+
+`status/2` therefore runs read-only `exec` calls in each router: `wg show wg0 latest-handshakes`, `wg show wg0 transfer` and `wg show wg0 endpoints`. It returns, per peer, its public key, last handshake time (or `:never`), bytes received and sent, and the endpoint it was last seen at. It MUST NOT use `wg show` without an argument, `wg show wg0 dump` or `wg showconf`, all of which print the private key.
+
+The host turns these results into actionable status. For example, "node 3's router for project A has never completed a handshake: check that UDP 51823 reaches 203.0.113.7".
+
+## Host prerequisites
+
+Nothing is installed on the host. The host needs:
+
+- standalone Incus 7.x;
+- Linux kernel ≥ 5.6, which includes WireGuard (loaded through `linux.kernel_modules`);
+- for `reachable` nodes, the per-project UDP ports reachable at the node's public address;
+- no other host firewall that drops traffic Incus forwards.
+
+The first two are checked by preflight. The last two can only be seen through peer status (decision 12).
 
 ## Risks / Trade-offs
 
@@ -181,10 +231,12 @@ Turning on `restricted=true` blocks other features by default (backups, snapshot
 - **One container per project per node.** Simple isolation, but container count grows with projects × nodes. Acceptable for this change's target scale. A future change could consolidate if evidence demands it.
 - **Relay load.** The lowest-ID reachable node carries relayed traffic for each project with several NATed nodes. A later change could pick relays by capacity.
 - **Restricted-project defaults.** Keeping the project's prior behaviour by default could hide that `restricted=true` is now set. → `apply/3` reports the keys it set, and the host shows them.
+- **Image supply chain.** Every router runs an image built here. → reproducible CI build, a published SHA-256 and provenance, and fingerprint pinning at apply time. A mismatched image is never used.
+- **Invisible host firewalls.** The library can't detect a closed UDP port or a dropping host firewall before the fact. → peer status (decision 12) makes the failure visible and points at the likely cause.
 
 ## Open Questions
 
-1. Should the router image be a published Opsmaru image, or a stock distribution image plus packages installed by `exec` at creation? (This change: host-supplied, requirements documented.)
-2. Should a cluster be one mesh node (option 9a) or per-member bridges (9b)?
-3. Should the transit range, the port base and the reserved index be configurable per host, or fixed for the whole mesh?
-4. Should Opsmaru ask Incus upstream for a project restriction on NIC `ipv4.routes`?
+1. Should a cluster be one mesh node (option 9a) or per-member bridges (9b)?
+2. Should the transit range, the port base and the reserved index be configurable per host, or fixed for the whole mesh?
+3. Should Opsmaru ask Incus upstream for a project restriction on NIC `ipv4.routes`?
+4. Should central Opsmaru serve the router image itself (SimpleStreams), or upload it to each node? The library supports both; this decides the default.

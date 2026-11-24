@@ -18,21 +18,21 @@ Loading or starting `:opsmaru_mesh` MUST NOT start any process, listener, timer,
 
 ### Requirement: Supported node preflight
 
-Before changing a node, `apply/3` SHALL verify that the server is not clustered, uses the nftables firewall driver and reports a kernel of at least 5.6. It SHALL fail with a typed error, changing nothing, when any check fails.
+Before changing a node, `apply/3` SHALL verify that the server is not clustered and reports a kernel of at least 5.6. It SHALL fail with a typed error, changing nothing, when any check fails. The library SHALL NOT require anything to be installed on the host.
 
 #### Scenario: Clustered server
 
 - **WHEN** the node reports `server_clustered: true`
 - **THEN** apply returns `{:error, :clustered_server}` and makes no change
 
-#### Scenario: xtables firewall
+#### Scenario: Kernel without WireGuard
 
-- **WHEN** the node reports a firewall driver other than nftables
-- **THEN** apply returns a typed error naming the firewall driver and makes no change
+- **WHEN** the node reports kernel version 5.4
+- **THEN** apply returns a typed error naming the kernel version and makes no change
 
 ### Requirement: Router instance per project per node
 
-For each joined project on a node, the library SHALL keep a router container in the Opsmaru-owned `opsmaru-mesh` project, with one NIC on the project's bridge at the node subnet's last host address with `ipv4.routes` set to the project block, and one NIC on the node's transit bridge. The router SHALL forward only between its WireGuard interface and its project NIC, only for traffic whose source and destination are within the project block, and, when it is a relay, between WireGuard peers within the block. Its configuration SHALL be stored inside the router and re-applied at boot without the control plane.
+For each joined project on a node, the library SHALL keep a router container in the Opsmaru-owned `opsmaru-mesh` project, with `linux.kernel_modules=wireguard`, one NIC on the project's bridge at the node subnet's last host address with `ipv4.routes` set to the project block, one NIC on the node's transit bridge, and a custom storage volume mounted at `/var/lib/opsmaru-mesh` that holds its key and pushed configuration. The router SHALL forward only between its WireGuard interface and its project NIC, only for traffic whose source and destination are within the project block, and, when it is a relay, between WireGuard peers within the block. Its configuration SHALL be stored on that volume and re-applied at boot without the control plane.
 
 #### Scenario: Router restart
 
@@ -43,6 +43,25 @@ For each joined project on a node, the library SHALL keep a router container in 
 
 - **WHEN** a packet whose source is outside the project block reaches the router's WireGuard interface
 - **THEN** the router drops it
+
+### Requirement: Pinned router image
+
+Routers SHALL be created and rebuilt only from an image whose fingerprint equals the one pinned in the mesh configuration, which by default is the image built from the same release of this library. The image SHALL be delivered either by uploading host-supplied bytes through the Incus images API or by having Incus download it from a configured image server, and the library SHALL verify the fingerprint in the `opsmaru-mesh` project before any router is created or rebuilt from it. Routers MUST NOT be created from a mutable alias. An image upgrade SHALL rebuild routers one at a time and keep each router's state volume, so its WireGuard key and peers are unchanged.
+
+#### Scenario: Fingerprint mismatch
+
+- **WHEN** the image found on the node has a different fingerprint than the pinned one
+- **THEN** apply stops at the image step with a typed error naming both fingerprints, and no router is created or rebuilt
+
+#### Scenario: Offline host
+
+- **WHEN** a node has no internet access and the host supplies the image bytes for upload
+- **THEN** the image is imported through the Incus API and routers are created from it
+
+#### Scenario: Image upgrade
+
+- **WHEN** a new release pins a new fingerprint and apply runs on a node with two routers
+- **THEN** the routers are rebuilt one after the other, and each returns the same public key as before
 
 ### Requirement: Node-local private keys
 
@@ -84,4 +103,23 @@ The library SHALL mark every object it creates with `user.opsmaru.mesh.managed=t
 #### Scenario: Project leaves the mesh
 
 - **WHEN** the host removes project `A` from a node with no attached tenant instances
-- **THEN** the default-profile NIC, the forward port, the router, the bridge and the ACL are removed in that order, and only then are `A`'s restriction keys restored from their supplied previous values, subject to the project-isolation rule against access to remaining mesh bridges
+- **THEN** the default-profile NIC, the forward port, the router, its state volume (destroying its key), the bridge and the ACL are removed in that order, and only then are `A`'s restriction keys restored from their supplied previous values, subject to the project-isolation rule against access to remaining mesh bridges
+
+### Requirement: Peer status without secrets
+
+`status/2` SHALL report, for each router on a node and each of its peers, the peer's public key, the time of its last WireGuard handshake or `:never`, the bytes received and sent, and the last seen endpoint. It SHALL obtain them only through read-only `exec` of `wg show wg0 latest-handshakes`, `wg show wg0 transfer` and `wg show wg0 endpoints`, and it MUST NOT run any command that prints a private key, including `wg show` with no arguments, `wg show wg0 dump` and `wg showconf`. `status/2` MUST NOT change any object.
+
+#### Scenario: Closed UDP port
+
+- **WHEN** a reachable node's WireGuard port is blocked by a cloud firewall
+- **THEN** its peers report `:never` for that node's router, and the result carries the node's public address and port so the host can point at the cause
+
+#### Scenario: Healthy peer
+
+- **WHEN** two routers of the same project have exchanged traffic
+- **THEN** each reports the other's last handshake time and non-zero transfer counts
+
+#### Scenario: No secret in status
+
+- **WHEN** `status/2` runs on a node
+- **THEN** no request, response or result contains a private key
