@@ -1,0 +1,36 @@
+name: CI
+# One run per commit: every pull request (including stacked PRs whose base is
+# another feature branch), and pushes to the long-lived branches after merge.
+# Feature branch pushes never trigger on their own; they get CI through their PR.
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  library:
+    # Central Opsmaru, the only planned consumer, runs on Linux.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Hostile web settings: the library must ignore them.
+      PHX_SERVER: 'true'
+      PORT: 'not-a-port'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          version: 2026.6.11
+          install: false
+      - run: mise trust && mise install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ hashFiles('mix.lock', 'mise.toml') }}
+          restore-keys: mix-${{ runner.os }}-
+      - run: mise exec -- mix local.hex --force && mise exec -- mix local.rebar --force && mise exec -- mix deps.get
+      - run: mise run check
